@@ -27,9 +27,10 @@ const CACHE_MAPPING = [
 ]
 const cacheInstances = {}
 const cacheEtagChecked = new Set()
+const inflightRequests = new Map()
 
 onmessage = function (evt) {
-  var data = evt.data //通过evt.data获得发送来的数据
+  const data = evt.data
   loadImage2(data)
 }
 
@@ -101,6 +102,7 @@ async function loadImage2(link) {
     const response = await cache.match(url)
 
     if (response) {
+      // 只有特定缓存目录才走协商缓存校验
       const latestResponse = cacheName === CACHE_WINDOW ? await updateCacheByEtag(link, url, cache, response) : response
       const arrayBuffer = await latestResponse.arrayBuffer()
       if (arrayBuffer) {
@@ -121,36 +123,49 @@ async function updateCacheByEtag(link, url, cache, cachedResponse) {
     return cachedResponse
   }
 
+  // 检查是否存在正在进行的校验请求，若有则直接复用
+  if (inflightRequests.has(url)) {
+    return inflightRequests.get(url)
+  }
+
   const etag = cachedResponse.headers.get('etag')
+  const lastModified = cachedResponse.headers.get('last-modified')
 
-  if (!etag) {
+  if (!etag && !lastModified) {
     return cachedResponse
   }
 
-  try {
-    const response = await fetch(link, {
-      headers: {
-        'If-None-Match': etag
+  const headers = {}
+  if (etag) headers['If-None-Match'] = etag
+  if (lastModified) headers['If-Modified-Since'] = lastModified
+
+  const fetchPromise = (async () => {
+    try {
+      const response = await fetch(link, { headers })
+
+      if (response.status === 304) {
+        cacheEtagChecked.add(url)
+        return cachedResponse
       }
-    })
 
-    if (response.status === 304) {
-      cacheEtagChecked.add(url)
+      if (response.ok) {
+        const responseClone = response.clone()
+        await cache.put(url, responseClone)
+        cacheEtagChecked.add(url)
+        return response
+      }
+
       return cachedResponse
-    }
-
-    if (!response.ok) {
+    } catch (e) {
+      console.log(e)
       return cachedResponse
+    } finally {
+      inflightRequests.delete(url)
     }
+  })()
 
-    const responseClone = response.clone()
-    await cache.put(url, responseClone)
-    cacheEtagChecked.add(url)
-    return response
-  } catch (e) {
-    console.log(e)
-    return cachedResponse
-  }
+  inflightRequests.set(url, fetchPromise)
+  return fetchPromise
 }
 
 function getCacheName(link) {
@@ -160,7 +175,6 @@ function getCacheName(link) {
 async function checkCache() {
   try {
     const cache = await caches.open(CACHE_UI)
-    // 缓存太多 matchAll keys 都耗时严重
     const cacheKeys = await cache.keys()
     const cacheSet = new Set()
 
@@ -172,7 +186,6 @@ async function checkCache() {
       for (const key of cacheKeys) {
         cache.delete(key.url)
       }
-
       console.log('worker:clearCache')
     }
   } catch (e) {
@@ -226,18 +239,12 @@ async function fetchImage(link) {
 
 function doCreateImageBitmap(response, url) {
   try {
-    //showMsgToMain("hihidoCreateImageBitmap");
-    //showMsgToMain("doCreateImageBitmap:"+response);
-    //var startTime=getTimeNow();
-    //showMsgToMain("new self.Blob");
     const startTime = getTimeNow()
-
     response = new self.Blob([response], { type: 'image/png' })
 
     self
       .createImageBitmap(response)
       .then(function (imageBitmap) {
-        //showMsgToMain("imageBitmapCreated:");
         const data = {}
         data.url = url
         data.imageBitmap = imageBitmap
